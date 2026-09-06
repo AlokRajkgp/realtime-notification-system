@@ -1,0 +1,31 @@
+<!doctype html>
+<!--
+  Not the project's frontend (that's a later step) — a throwaway page for
+  eyeballing the in-app WebSocket channel while developing. Open directly
+  in a browser (no server needed for this file itself) with the api
+  running on localhost:8080.
+-->
+<html>
+<head><meta charset="utf-8"><title>ws-test</title></head>
+<body style="font-family: monospace">
+  <label>user_id: <input id="uid" value="u1"></label>
+  <button onclick="connect()">connect</button>
+  <span id="status">disconnected</span>
+  <pre id="log"></pre>
+
+  <script>
+    function connect() {
+      const userId = document.getElementById('uid').value;
+      const ws = new WebSocket(`ws://localhost:8080/ws?user_id=${encodeURIComponent(userId)}`);
+      const log = document.getElementById('log');
+      const status = document.getElementById('status');
+      ws.onopen = () => status.textContent = 'connected as ' + userId;
+      ws.onclose = () => status.textContent = 'disconnected';
+      ws.onerror = (e) => status.textContent = 'error (see console)';
+      ws.onmessage = (e) => {
+        log.textContent = new Date().toISOString() + '  ' + e.data + '\n' + log.textContent;
+      };
+    }
+  </script>
+</body>
+</html>

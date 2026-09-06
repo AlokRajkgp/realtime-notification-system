@@ -7,9 +7,10 @@ idempotent, retried, rate-limited, observable delivery.
 
 ## Status
 
-Step 1 of the build — repo scaffold, local infra, and the producer API only.
-Nothing downstream of Kafka exists yet (no consumer, no DB schema, no
-channel adapters, no frontend). See "Roadmap" below.
+Repo scaffold, local infra, the producer API, a Postgres-backed idempotent
+consumer/worker, and one real channel adapter (in-app, over WebSocket +
+Redis Pub/Sub). Email/push adapters, preferences, rate limiting, retry/DLQ,
+metrics, and the frontend don't exist yet. See "Roadmap" below.
 
 ## Stack
 
@@ -27,14 +28,18 @@ channel adapters, no frontend). See "Roadmap" below.
 
 ```
 cmd/
-  api/       # producer REST API — accepts events, publishes to Kafka
-  worker/    # consumer group -> channel adapters (placeholder for now)
+  api/       # producer REST API — accepts events, publishes to Kafka, serves the WebSocket
+  worker/    # consumer group -> channel adapters
 internal/
-  api/       # Gin router + handlers
-  config/    # env var loading
+  adapters/     # one Adapter per delivery channel (in-app so far)
+  api/          # Gin router + handlers
+  config/       # env var loading
+  db/           # Postgres store: delivery_status claim/mark/query
   kafkaclient/  # Kafka producer/consumer wrappers
-  models/    # shared structs
+  models/       # shared structs
+  ws/           # WebSocket hub for the in-app channel
 migrations/  # golang-migrate .sql files
+tools/ws-test.html  # throwaway browser page for eyeballing the in-app channel
 docker-compose.yml  # Postgres + Redis + Redpanda (+ console) for local dev
 ```
 
@@ -70,14 +75,27 @@ returns the per-channel delivery outcome from Postgres. POST the same
 logs "duplicate delivery skipped" instead of a second delivery — that's the
 `delivery_status` unique constraint doing its job.
 
+### Watching the in-app channel live
+
+Open `tools/ws-test.html` directly in a browser (with `make up`/`run-api`/
+`run-worker` running), click connect with `user_id=u1`, then POST an event
+for `u1` as above — the event JSON appears in the page immediately. Under
+the hood: the worker's `in-app` adapter (`internal/adapters`) publishes to a
+per-user Redis Pub/Sub channel, and whichever API instance holds that
+user's WebSocket (`internal/ws`) forwards it to the browser. If nobody's
+connected when the event is delivered, Redis Pub/Sub simply has zero
+subscribers — the in-app channel intentionally doesn't queue for offline
+users (email/push will, once built).
+
 ## Roadmap
 
 - [x] Repo scaffold, docker-compose (Postgres/Redis/Redpanda), producer API
 - [x] Postgres schema: delivery_status (doubles as the dedupe/idempotency table)
-- [x] Consumer group + idempotent delivery claiming (channel adapters are still a log line, not real sends)
+- [x] Consumer group + idempotent delivery claiming
 - [x] Delivery status query API (`GET /api/v1/events/:event_id/status`)
-- [ ] Real channel adapters (in-app WS/SSE, email, push/SMS)
-- [ ] User preferences table + opt-in/out + DND windows (worker currently sends every event to every channel)
+- [x] In-app channel adapter: WebSocket + Redis Pub/Sub fan-out
+- [ ] Email + one more channel adapter (push or SMS stub)
+- [ ] User preferences table + opt-in/out + DND windows (worker currently sends every event to every registered adapter)
 - [ ] Retry with backoff + Dead Letter Queue + admin replay endpoint
 - [ ] Per-user rate limiting (Redis token bucket)
 - [ ] Prometheus /metrics + Grafana dashboard

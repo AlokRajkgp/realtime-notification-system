@@ -1,17 +1,17 @@
 // Command worker is the consumer group: it reads events off Kafka and, for
-// each channel it knows about, idempotently claims and records a delivery
-// attempt in Postgres. Run 2-3 instances (same KAFKA_GROUP_ID) to see Kafka
-// spread partitions across them.
+// each registered channel adapter, idempotently claims and records a
+// delivery attempt in Postgres. Run 2-3 instances (same KAFKA_GROUP_ID) to
+// see Kafka spread partitions across them.
 //
 // What this step deliberately does NOT do yet (later roadmap steps):
-//   - real channel adapters (in-app WS/SSE, email, push) — delivery is a
-//     log line for now, standing in for "sent"
+//   - email/push channel adapters — only "in-app" (Redis Pub/Sub, see
+//     internal/adapters) is registered so far
 //   - per-user preferences (opt-in/out, DND) — every event goes to every
-//     channel in the static `channels` list below
-//   - retry-with-backoff / dead-letter queue — a failed claim or mark is
+//     registered adapter
+//   - retry-with-backoff / dead-letter queue — a failed claim or send is
 //     logged and the offset is still committed, so today a transient
-//     Postgres error means that (event_id, channel) is simply never
-//     retried. That gap is exactly what the DLQ + admin-replay step fixes.
+//     failure means that (event_id, channel) is simply never retried.
+//     That gap is exactly what the DLQ + admin-replay step fixes.
 package main
 
 import (
@@ -19,15 +19,14 @@ import (
 	"encoding/json"
 	"log"
 
+	"github.com/redis/go-redis/v9"
+
+	"realtime-notification-system/internal/adapters"
 	"realtime-notification-system/internal/config"
 	"realtime-notification-system/internal/db"
 	"realtime-notification-system/internal/kafkaclient"
 	"realtime-notification-system/internal/models"
 )
-
-// Channels this worker currently delivers every event to. Once user
-// preferences exist, this becomes per-user/per-event instead of static.
-var channels = []string{"in-app"}
 
 func main() {
 	cfg := config.Load()
@@ -38,6 +37,15 @@ func main() {
 	}
 	defer conn.Close()
 	store := db.NewStore(conn)
+
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, Password: cfg.RedisPassword})
+	defer rdb.Close()
+
+	// Every event goes to every adapter in this list. Once user preferences
+	// exist, this becomes a per-user/per-event selection instead of static.
+	channelAdapters := []adapters.Adapter{
+		adapters.NewInApp(rdb),
+	}
 
 	consumer := kafkaclient.NewConsumer(cfg.KafkaBrokers, cfg.KafkaEventsTopic, cfg.KafkaGroupID)
 	defer consumer.Close()
@@ -62,27 +70,41 @@ func main() {
 			continue
 		}
 
-		for _, channel := range channels {
-			claimed, err := store.ClaimDelivery(ctx, event.EventID, event.UserID, channel)
-			if err != nil {
-				log.Printf("worker: claim failed event=%s channel=%s: %v", event.EventID, channel, err)
-				continue
-			}
-			if !claimed {
-				log.Printf("worker: duplicate delivery skipped event=%s channel=%s", event.EventID, channel)
-				continue
-			}
-
-			// Stand-in "adapter" — real email/push/in-app delivery is a later step.
-			log.Printf("worker: delivering event=%s user=%s type=%s via channel=%s", event.EventID, event.UserID, event.Type, channel)
-
-			if err := store.MarkStatus(ctx, event.EventID, channel, "sent", nil); err != nil {
-				log.Printf("worker: mark status failed event=%s channel=%s: %v", event.EventID, channel, err)
-			}
+		for _, adapter := range channelAdapters {
+			deliver(ctx, store, adapter, event)
 		}
 
 		if err := consumer.Commit(ctx, msg); err != nil {
 			log.Printf("worker: commit failed offset=%d: %v", msg.Offset, err)
 		}
+	}
+}
+
+// deliver claims (event, adapter) idempotently, sends via the adapter if
+// this call won the claim, and records the outcome.
+func deliver(ctx context.Context, store *db.Store, adapter adapters.Adapter, event models.Event) {
+	channel := adapter.Name()
+
+	claimed, err := store.ClaimDelivery(ctx, event.EventID, event.UserID, channel)
+	if err != nil {
+		log.Printf("worker: claim failed event=%s channel=%s: %v", event.EventID, channel, err)
+		return
+	}
+	if !claimed {
+		log.Printf("worker: duplicate delivery skipped event=%s channel=%s", event.EventID, channel)
+		return
+	}
+
+	sendErr := adapter.Send(ctx, event)
+	status := "sent"
+	if sendErr != nil {
+		status = "failed"
+		log.Printf("worker: delivery failed event=%s channel=%s: %v", event.EventID, channel, sendErr)
+	} else {
+		log.Printf("worker: delivered event=%s user=%s type=%s via channel=%s", event.EventID, event.UserID, event.Type, channel)
+	}
+
+	if err := store.MarkStatus(ctx, event.EventID, channel, status, sendErr); err != nil {
+		log.Printf("worker: mark status failed event=%s channel=%s: %v", event.EventID, channel, err)
 	}
 }
