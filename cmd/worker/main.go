@@ -1,13 +1,12 @@
 // Command worker is the consumer group: it reads events off Kafka and, for
 // each registered channel adapter, idempotently claims and records a
-// delivery attempt in Postgres. Run 2-3 instances (same KAFKA_GROUP_ID) to
-// see Kafka spread partitions across them.
+// delivery attempt in Postgres — honoring per-user channel opt-in/out and
+// DND windows along the way. Run 2-3 instances (same KAFKA_GROUP_ID) to see
+// Kafka spread partitions across them.
 //
 // What this step deliberately does NOT do yet (later roadmap steps):
 //   - email/push channel adapters — only "in-app" (Redis Pub/Sub, see
 //     internal/adapters) is registered so far
-//   - per-user preferences (opt-in/out, DND) — every event goes to every
-//     registered adapter
 //   - retry-with-backoff / dead-letter queue — a failed claim or send is
 //     logged and the offset is still committed, so today a transient
 //     failure means that (event_id, channel) is simply never retried.
@@ -26,6 +25,7 @@ import (
 	"realtime-notification-system/internal/db"
 	"realtime-notification-system/internal/kafkaclient"
 	"realtime-notification-system/internal/models"
+	"realtime-notification-system/internal/preferences"
 )
 
 func main() {
@@ -37,12 +37,13 @@ func main() {
 	}
 	defer conn.Close()
 	store := db.NewStore(conn)
+	checker := preferences.NewChecker(store)
 
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, Password: cfg.RedisPassword})
 	defer rdb.Close()
 
-	// Every event goes to every adapter in this list. Once user preferences
-	// exist, this becomes a per-user/per-event selection instead of static.
+	// Every event is offered to every adapter in this list; whether it's
+	// actually sent depends on that user's preferences (see deliver below).
 	channelAdapters := []adapters.Adapter{
 		adapters.NewInApp(rdb),
 	}
@@ -71,7 +72,7 @@ func main() {
 		}
 
 		for _, adapter := range channelAdapters {
-			deliver(ctx, store, adapter, event)
+			deliver(ctx, store, checker, adapter, event)
 		}
 
 		if err := consumer.Commit(ctx, msg); err != nil {
@@ -80,9 +81,10 @@ func main() {
 	}
 }
 
-// deliver claims (event, adapter) idempotently, sends via the adapter if
-// this call won the claim, and records the outcome.
-func deliver(ctx context.Context, store *db.Store, adapter adapters.Adapter, event models.Event) {
+// deliver claims (event, adapter) idempotently, checks the user's
+// preferences, and only then sends via the adapter — recording whichever
+// outcome actually happened.
+func deliver(ctx context.Context, store *db.Store, checker *preferences.Checker, adapter adapters.Adapter, event models.Event) {
 	channel := adapter.Name()
 
 	claimed, err := store.ClaimDelivery(ctx, event.EventID, event.UserID, channel)
@@ -92,6 +94,20 @@ func deliver(ctx context.Context, store *db.Store, adapter adapters.Adapter, eve
 	}
 	if !claimed {
 		log.Printf("worker: duplicate delivery skipped event=%s channel=%s", event.EventID, channel)
+		return
+	}
+
+	allowed, err := checker.Allowed(ctx, event.UserID, channel)
+	if err != nil {
+		// Fail closed: record it as failed (visible in delivery_status)
+		// rather than guessing whether the user actually wanted this.
+		log.Printf("worker: preference check failed event=%s channel=%s: %v", event.EventID, channel, err)
+		_ = store.MarkStatus(ctx, event.EventID, channel, "failed", err)
+		return
+	}
+	if !allowed {
+		log.Printf("worker: skipped by preferences event=%s channel=%s", event.EventID, channel)
+		_ = store.MarkStatus(ctx, event.EventID, channel, "skipped", nil)
 		return
 	}
 

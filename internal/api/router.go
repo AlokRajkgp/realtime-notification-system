@@ -17,6 +17,11 @@ func NewRouter(s *Server, hub *ws.Hub) *gin.Engine {
 	{
 		v1.POST("/events", s.CreateEvent)
 		v1.GET("/events/:event_id/status", s.GetEventStatus)
+
+		v1.GET("/users/:user_id/preferences", s.GetPreferences)
+		v1.PUT("/users/:user_id/preferences/:channel", s.SetChannelPreference)
+		v1.PUT("/users/:user_id/dnd", s.SetDND)
+		v1.DELETE("/users/:user_id/dnd", s.ClearDND)
 	}
 
 	return r

@@ -8,9 +8,10 @@ idempotent, retried, rate-limited, observable delivery.
 ## Status
 
 Repo scaffold, local infra, the producer API, a Postgres-backed idempotent
-consumer/worker, and one real channel adapter (in-app, over WebSocket +
-Redis Pub/Sub). Email/push adapters, preferences, rate limiting, retry/DLQ,
-metrics, and the frontend don't exist yet. See "Roadmap" below.
+consumer/worker honoring per-user preferences, and one real channel adapter
+(in-app, over WebSocket + Redis Pub/Sub). Email/push adapters, rate
+limiting, retry/DLQ, metrics, and the frontend don't exist yet. See
+"Roadmap" below.
 
 ## Stack
 
@@ -34,9 +35,10 @@ internal/
   adapters/     # one Adapter per delivery channel (in-app so far)
   api/          # Gin router + handlers
   config/       # env var loading
-  db/           # Postgres store: delivery_status claim/mark/query
+  db/           # Postgres store: delivery_status, preferences, DND — claim/mark/query
   kafkaclient/  # Kafka producer/consumer wrappers
   models/       # shared structs
+  preferences/  # combines opt-in/out + DND into one Allowed() check (worker-only)
   ws/           # WebSocket hub for the in-app channel
 migrations/  # golang-migrate .sql files
 tools/ws-test.html  # throwaway browser page for eyeballing the in-app channel
@@ -87,6 +89,24 @@ connected when the event is delivered, Redis Pub/Sub simply has zero
 subscribers — the in-app channel intentionally doesn't queue for offline
 users (email/push will, once built).
 
+### Preferences and DND
+
+```
+# Opt a user out of a channel (any channel not listed here is implicitly enabled)
+curl -X PUT localhost:8080/api/v1/users/u2/preferences/in-app -d '{"enabled":false}'
+
+# Set a quiet-hours window (End before Start means it wraps past midnight)
+curl -X PUT localhost:8080/api/v1/users/u2/dnd -d '{"start":"22:00","end":"07:00","timezone":"Asia/Kolkata"}'
+
+curl localhost:8080/api/v1/users/u2/preferences   # see current channels + dnd
+curl -X DELETE localhost:8080/api/v1/users/u2/dnd  # remove quiet hours
+```
+
+The worker checks both before ever calling an adapter: opted-out or inside
+a DND window records `delivery_status.status = "skipped"` (not "sent" or
+"failed") — same idempotent claim as everything else, so a redelivered
+Kafka message can't cause a duplicate skip entry either.
+
 ## Roadmap
 
 - [x] Repo scaffold, docker-compose (Postgres/Redis/Redpanda), producer API
@@ -94,8 +114,8 @@ users (email/push will, once built).
 - [x] Consumer group + idempotent delivery claiming
 - [x] Delivery status query API (`GET /api/v1/events/:event_id/status`)
 - [x] In-app channel adapter: WebSocket + Redis Pub/Sub fan-out
+- [x] User preferences: per-channel opt-in/out + DND windows
 - [ ] Email + one more channel adapter (push or SMS stub)
-- [ ] User preferences table + opt-in/out + DND windows (worker currently sends every event to every registered adapter)
 - [ ] Retry with backoff + Dead Letter Queue + admin replay endpoint
 - [ ] Per-user rate limiting (Redis token bucket)
 - [ ] Prometheus /metrics + Grafana dashboard
