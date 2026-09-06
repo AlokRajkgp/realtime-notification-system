@@ -7,10 +7,21 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/redis/go-redis/v9"
+)
+
+const (
+	// pongWait is how long we'll wait for a pong (or any other read) before
+	// deciding the connection is dead. writeWait bounds how long a single
+	// write may take. pingPeriod must be comfortably less than pongWait, so
+	// there's at least one full round trip of slack before the deadline.
+	pongWait   = 20 * time.Second
+	pingPeriod = 15 * time.Second
+	writeWait  = 5 * time.Second
 )
 
 var upgrader = websocket.Upgrader{
@@ -55,11 +66,32 @@ func (h *Hub) ServeWS(c *gin.Context) {
 	sub := h.rdb.Subscribe(ctx, "notify:inapp:"+userID)
 	defer sub.Close()
 
+	// Keepalive: TCP staying "up" only means the OS-level connection hasn't
+	// been torn down — it says nothing about whether the other process is
+	// still there and reading (a frozen tab, a laptop that went to sleep
+	// without closing sockets, a NAT box that silently drops idle mappings
+	// all look identical to TCP: still connected). Ping/pong is an
+	// application-level heartbeat that actually answers that question.
+	//
+	// The read deadline starts at pongWait. A browser's WebSocket client
+	// answers a Ping automatically at the protocol level (invisible to
+	// page JS) — SetPongHandler is how gorilla surfaces that reply to us,
+	// and every pong received pushes the deadline forward. If pongWait
+	// elapses with no pong, the blocked ReadMessage call below returns a
+	// timeout error — which the existing error handling already treats as
+	// "connection is gone" via cancel(). No new failure path needed.
+	conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+
 	// gorilla/websocket requires the connection to be read continuously to
 	// process control frames (ping/pong/close) and notice the browser
 	// closing the tab — even though this endpoint never expects an
 	// application message from the client. Reading in a goroutine and
-	// cancelling ctx on any read error is the standard way to detect that.
+	// cancelling ctx on any read error (including a deadline timeout) is
+	// the standard way to detect that.
 	go func() {
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
@@ -72,15 +104,25 @@ func (h *Hub) ServeWS(c *gin.Context) {
 	log.Printf("ws: user=%s connected", userID)
 	defer log.Printf("ws: user=%s disconnected", userID)
 
+	pingTicker := time.NewTicker(pingPeriod)
+	defer pingTicker.Stop()
+
 	ch := sub.Channel()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-pingTicker.C:
+			conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				log.Printf("ws: ping failed user=%s: %v", userID, err)
+				return
+			}
 		case msg, ok := <-ch:
 			if !ok {
 				return
 			}
+			conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := conn.WriteMessage(websocket.TextMessage, []byte(msg.Payload)); err != nil {
 				log.Printf("ws: write failed user=%s: %v", userID, err)
 				return

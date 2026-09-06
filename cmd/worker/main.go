@@ -2,7 +2,8 @@
 // each registered channel adapter, idempotently claims and records a
 // delivery attempt in Postgres — honoring per-user channel opt-in/out and
 // DND windows along the way. Run 2-3 instances (same KAFKA_GROUP_ID) to see
-// Kafka spread partitions across them.
+// Kafka spread partitions across them (the topic needs more than 1
+// partition for that to do anything — see `make kafka-topic`).
 //
 // What this step deliberately does NOT do yet (later roadmap steps):
 //   - email/push channel adapters — only "in-app" (Redis Pub/Sub, see
@@ -17,6 +18,10 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -27,6 +32,12 @@ import (
 	"realtime-notification-system/internal/models"
 	"realtime-notification-system/internal/preferences"
 )
+
+// processTimeout bounds how long a single already-fetched message is given
+// to finish (claim + preference check + adapter sends + commit) once a
+// shutdown signal has arrived. It's intentionally NOT the same context used
+// to wait for the *next* message — see the comment on rootCtx below.
+const processTimeout = 15 * time.Second
 
 func main() {
 	cfg := config.Load()
@@ -51,34 +62,64 @@ func main() {
 	consumer := kafkaclient.NewConsumer(cfg.KafkaBrokers, cfg.KafkaEventsTopic, cfg.KafkaGroupID)
 	defer consumer.Close()
 
-	ctx := context.Background()
-	log.Printf("worker: consuming topic=%s group=%s brokers=%v", cfg.KafkaEventsTopic, cfg.KafkaGroupID, cfg.KafkaBrokers)
+	pid := os.Getpid()
 
+	// rootCtx is cancelled the instant SIGINT/SIGTERM arrives. It is used
+	// ONLY to unblock the "wait for the next message" call below — it is
+	// deliberately never passed into deliver() for a message already in
+	// hand, because pgx and go-redis both honor context cancellation and
+	// would abort a half-done DB write or Redis publish mid-flight. That
+	// would turn a clean shutdown into the exact "crashed mid-processing"
+	// failure case the audit flagged — self-inflicted, avoidably. A message
+	// already fetched gets its own bounded-but-separate context
+	// (processTimeout) instead, so it's allowed to finish.
+	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log.Printf("worker: pid=%d consuming topic=%s group=%s brokers=%v", pid, cfg.KafkaEventsTopic, cfg.KafkaGroupID, cfg.KafkaBrokers)
+
+runLoop:
 	for {
-		msg, err := consumer.FetchMessage(ctx)
+		msg, err := consumer.FetchMessage(rootCtx)
 		if err != nil {
+			if rootCtx.Err() != nil {
+				log.Printf("worker: pid=%d shutdown signal received, no message in flight", pid)
+				break runLoop
+			}
 			log.Printf("worker: fetch error: %v", err)
 			continue
 		}
+
+		procCtx, cancel := context.WithTimeout(context.Background(), processTimeout)
 
 		var event models.Event
 		if err := json.Unmarshal(msg.Value, &event); err != nil {
 			// A message we can never parse would otherwise block this
 			// partition forever. Commit past it now; routing it to a DLQ
 			// instead of dropping it is the retry/DLQ step's job.
-			log.Printf("worker: skipping unparseable message at offset %d: %v", msg.Offset, err)
-			_ = consumer.Commit(ctx, msg)
-			continue
+			log.Printf("worker: skipping unparseable message at partition=%d offset=%d: %v", msg.Partition, msg.Offset, err)
+			_ = consumer.Commit(procCtx, msg)
+		} else {
+			log.Printf("worker: pid=%d fetched partition=%d offset=%d event=%s user=%s", pid, msg.Partition, msg.Offset, event.EventID, event.UserID)
+
+			for _, adapter := range channelAdapters {
+				deliver(procCtx, store, checker, adapter, event)
+			}
+
+			if err := consumer.Commit(procCtx, msg); err != nil {
+				log.Printf("worker: commit failed partition=%d offset=%d: %v", msg.Partition, msg.Offset, err)
+			}
 		}
 
-		for _, adapter := range channelAdapters {
-			deliver(ctx, store, checker, adapter, event)
-		}
+		cancel()
 
-		if err := consumer.Commit(ctx, msg); err != nil {
-			log.Printf("worker: commit failed offset=%d: %v", msg.Offset, err)
+		if rootCtx.Err() != nil {
+			log.Printf("worker: pid=%d shutdown signal received, exiting after finishing in-flight message", pid)
+			break runLoop
 		}
 	}
+
+	log.Printf("worker: pid=%d closed cleanly", pid)
 }
 
 // deliver claims (event, adapter) idempotently, checks the user's

@@ -49,10 +49,11 @@ docker-compose.yml  # Postgres + Redis + Redpanda (+ console) for local dev
 
 ```
 cp .env.example .env
-make up            # starts Postgres, Redis, Redpanda, Redpanda Console (localhost:8081)
-make migrate-up     # creates delivery_status, user_preferences, user_dnd_windows
-make run-api        # producer API on :8080
-make run-worker      # consumer group — run in a second terminal (start 2-3 for a real "group")
+make up             # starts Postgres, Redis, Redpanda, Redpanda Console (localhost:8081)
+make kafka-topic     # creates notifications.events with 3 partitions (see "Scaling" below)
+make migrate-up      # creates delivery_status, user_preferences, user_dnd_windows
+make run-api         # producer API on :8080
+make run-worker      # consumer group — run in 2-3 terminals to see partitions spread across them
 ```
 
 Send a test event:
@@ -106,6 +107,42 @@ The worker checks both before ever calling an adapter: opted-out or inside
 a DND window records `delivery_status.status = "skipped"` (not "sent" or
 "failed") — same idempotent claim as everything else, so a redelivered
 Kafka message can't cause a duplicate skip entry either.
+
+### Scaling: partitions and consumer groups
+
+`notifications.events` runs with 3 partitions (`make kafka-topic`), keyed by
+`user_id` — same user always hashes to the same partition (ordering
+per-user), different users spread across all 3. A Kafka consumer group can
+have at most one *active* consumer per partition, so this is also the hard
+ceiling on how many `run-worker` instances can do useful work at once; a
+4th instance in the same group would sit idle unless one of the other 3
+dies. Verified locally: ran 3 worker processes in the same consumer group,
+published events for 6 distinct users, and confirmed via `rpk group
+describe notification-workers` that each worker owned exactly one
+partition and processed messages in parallel (not sequentially).
+
+### Graceful shutdown
+
+Both `cmd/api` and `cmd/worker` handle SIGINT/SIGTERM: the API stops
+accepting new connections and gives in-flight requests up to 10s to finish
+(`http.Server.Shutdown`) before exiting; the worker stops fetching *new*
+Kafka messages immediately but lets a message already in hand finish
+(claim + adapter send + commit) before exiting. One known, deliberate gap:
+`http.Server.Shutdown` does not track or wait for hijacked connections, and
+a WebSocket upgrade is exactly that — an open `/ws` connection is dropped
+immediately (not gracefully closed) when the API process exits. Verified
+locally with `kill -TERM` against a running process in three scenarios:
+idle, an open WebSocket connection, and a worker mid-way through a batch of
+20 events (which finished delivering all 20 before exiting).
+
+### WebSocket keepalive
+
+`/ws` connections ping every 15s and expect a pong within 20s; no pong in
+that window (a frozen tab, a sleeping laptop, a dead NAT mapping — anything
+where the TCP socket looks fine but nothing is actually reading) closes the
+connection server-side. Verified locally: a client that stops reading after
+connecting (holding the TCP socket open but never answering pings) was
+detected and disconnected in exactly 20s.
 
 ## Roadmap
 

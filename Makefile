@@ -1,8 +1,17 @@
-.PHONY: up down logs run-api run-worker build migrate-up migrate-down
+.PHONY: up down logs run-api run-worker build migrate-up migrate-down kafka-topic
 
 ## Start Postgres, Redis, Redpanda (+ console) in the background.
 up:
 	docker compose up -d
+
+## Create the notifications.events topic with a fixed partition count
+## *before* anything produces to it. Redpanda auto-creates a topic on
+## first publish, but with only 1 partition by default -- that silently
+## caps the consumer group at 1 useful worker no matter how many you run.
+## Run this once after `make up` on a fresh environment (safe to re-run;
+## it's a no-op if the topic already exists with the right partition count).
+kafka-topic:
+	docker compose exec -T redpanda rpk topic create notifications.events --partitions 3 --replicas 1 2>&1 | grep -v "TOPIC_ALREADY_EXISTS" || true
 
 ## Stop and remove the local infra containers (data volumes kept).
 down:
