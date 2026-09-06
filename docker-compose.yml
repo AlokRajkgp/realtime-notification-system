@@ -9,7 +9,10 @@ services:
       POSTGRES_PASSWORD: notify
       POSTGRES_DB: notify
     ports:
-      - "5432:5432"
+      # Host port 5433, not 5432: many dev machines already have a native
+      # Postgres listening on 5432 (Postgres.app, `brew services`, etc.),
+      # which would silently intercept connections meant for this container.
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

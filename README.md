@@ -42,8 +42,10 @@ docker-compose.yml  # Postgres + Redis + Redpanda (+ console) for local dev
 
 ```
 cp .env.example .env
-make up          # starts Postgres, Redis, Redpanda, Redpanda Console (localhost:8081)
-make run-api     # starts the producer API on :8080
+make up            # starts Postgres, Redis, Redpanda, Redpanda Console (localhost:8081)
+make migrate-up     # creates the delivery_status table
+make run-api        # producer API on :8080
+make run-worker      # consumer group — run in a second terminal (start 2-3 for a real "group")
 ```
 
 Send a test event:
@@ -54,19 +56,30 @@ curl -i -X POST localhost:8080/api/v1/events \
   -d '{"user_id":"u1","type":"order.shipped","payload":{"order_id":"o123"}}'
 ```
 
-A `202 Accepted` with an `event_id` means it reached Kafka. Watch it land in
-the `notifications.events` topic at `localhost:8081` (Redpanda Console).
+A `202 Accepted` with an `event_id` means it reached Kafka — you can also
+watch it land in the `notifications.events` topic at `localhost:8081`
+(Redpanda Console). A moment later, the worker log shows it being
+"delivered", and:
+
+```
+curl localhost:8080/api/v1/events/<event_id>/status
+```
+
+returns the per-channel delivery outcome from Postgres. POST the same
+`event_id` twice (or restart the worker before it commits) and the worker
+logs "duplicate delivery skipped" instead of a second delivery — that's the
+`delivery_status` unique constraint doing its job.
 
 ## Roadmap
 
 - [x] Repo scaffold, docker-compose (Postgres/Redis/Redpanda), producer API
-- [ ] Postgres schema: users, preferences, delivery_status, dedupe
-- [ ] Consumer group + channel adapters (in-app WS/SSE, email, push/SMS)
-- [ ] Idempotent delivery (dedupe by event ID)
+- [x] Postgres schema: delivery_status (doubles as the dedupe/idempotency table)
+- [x] Consumer group + idempotent delivery claiming (channel adapters are still a log line, not real sends)
+- [x] Delivery status query API (`GET /api/v1/events/:event_id/status`)
+- [ ] Real channel adapters (in-app WS/SSE, email, push/SMS)
+- [ ] User preferences table + opt-in/out + DND windows (worker currently sends every event to every channel)
 - [ ] Retry with backoff + Dead Letter Queue + admin replay endpoint
 - [ ] Per-user rate limiting (Redis token bucket)
-- [ ] User preferences API (opt-in/out, DND windows)
-- [ ] Delivery status query API
 - [ ] Prometheus /metrics + Grafana dashboard
 - [ ] Minimal React frontend
 - [ ] Load testing (k6/Locust) + benchmarks

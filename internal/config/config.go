@@ -40,7 +40,7 @@ func Load() Config {
 		KafkaEventsTopic: getEnv("KAFKA_EVENTS_TOPIC", "notifications.events"),
 		KafkaGroupID:     getEnv("KAFKA_GROUP_ID", "notification-workers"),
 
-		PostgresDSN: getEnv("POSTGRES_DSN", "postgres://notify:notify@localhost:5432/notify?sslmode=disable"),
+		PostgresDSN: getEnv("POSTGRES_DSN", "postgres://notify:notify@localhost:5433/notify?sslmode=disable"),
 
 		RedisAddr:     getEnv("REDIS_ADDR", "localhost:6379"),
 		RedisPassword: getEnv("REDIS_PASSWORD", ""),

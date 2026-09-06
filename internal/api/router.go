@@ -11,6 +11,7 @@ func NewRouter(s *Server) *gin.Engine {
 	v1 := r.Group("/api/v1")
 	{
 		v1.POST("/events", s.CreateEvent)
+		v1.GET("/events/:event_id/status", s.GetEventStatus)
 	}
 
 	return r

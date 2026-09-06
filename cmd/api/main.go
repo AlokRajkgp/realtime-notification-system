@@ -8,6 +8,7 @@ import (
 
 	"realtime-notification-system/internal/api"
 	"realtime-notification-system/internal/config"
+	"realtime-notification-system/internal/db"
 	"realtime-notification-system/internal/kafkaclient"
 )
 
@@ -17,7 +18,14 @@ func main() {
 	producer := kafkaclient.NewProducer(cfg.KafkaBrokers, cfg.KafkaEventsTopic)
 	defer producer.Close()
 
-	server := api.NewServer(producer)
+	conn, err := db.Connect(cfg.PostgresDSN)
+	if err != nil {
+		log.Fatalf("api: connect postgres: %v", err)
+	}
+	defer conn.Close()
+	store := db.NewStore(conn)
+
+	server := api.NewServer(producer, store)
 	router := api.NewRouter(server)
 
 	log.Printf("api: listening on :%s (kafka brokers=%v topic=%s)", cfg.HTTPPort, cfg.KafkaBrokers, cfg.KafkaEventsTopic)

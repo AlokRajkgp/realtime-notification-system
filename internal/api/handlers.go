@@ -7,6 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"realtime-notification-system/internal/db"
 	"realtime-notification-system/internal/kafkaclient"
 	"realtime-notification-system/internal/models"
 )
@@ -14,11 +15,12 @@ import (
 // Server bundles the dependencies HTTP handlers need.
 type Server struct {
 	producer *kafkaclient.Producer
+	store    *db.Store
 }
 
 // NewServer builds a Server.
-func NewServer(producer *kafkaclient.Producer) *Server {
-	return &Server{producer: producer}
+func NewServer(producer *kafkaclient.Producer, store *db.Store) *Server {
+	return &Server{producer: producer, store: store}
 }
 
 // createEventRequest is the shape a client POSTs to /api/v1/events.
@@ -62,6 +64,23 @@ func (s *Server) CreateEvent(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusAccepted, gin.H{"event_id": event.EventID, "status": "accepted"})
+}
+
+// GetEventStatus returns the delivery outcome for every channel a given
+// event was (or is being) delivered on. An event that was just published
+// and hasn't reached the worker yet legitimately returns an empty list —
+// this endpoint doesn't distinguish "not delivered yet" from "unknown event
+// ID" (there's no events table to check against yet).
+func (s *Server) GetEventStatus(c *gin.Context) {
+	eventID := c.Param("event_id")
+
+	rows, err := s.store.GetByEventID(c.Request.Context(), eventID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query delivery status"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"event_id": eventID, "deliveries": rows})
 }
 
 // Healthz is a liveness probe for the API process itself. It deliberately

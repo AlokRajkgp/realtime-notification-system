@@ -28,8 +28,8 @@ build:
 ## Apply all up migrations. Requires the golang-migrate CLI:
 ##   brew install golang-migrate
 migrate-up:
-	migrate -database "$${POSTGRES_DSN:-postgres://notify:notify@localhost:5432/notify?sslmode=disable}" -path migrations up
+	migrate -database "$${POSTGRES_DSN:-postgres://notify:notify@localhost:5433/notify?sslmode=disable}" -path migrations up
 
 ## Roll back the last migration.
 migrate-down:
-	migrate -database "$${POSTGRES_DSN:-postgres://notify:notify@localhost:5432/notify?sslmode=disable}" -path migrations down 1
+	migrate -database "$${POSTGRES_DSN:-postgres://notify:notify@localhost:5433/notify?sslmode=disable}" -path migrations down 1
