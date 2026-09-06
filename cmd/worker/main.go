@@ -1,17 +1,24 @@
-// Command worker is the consumer group: it reads events off Kafka and, for
-// each registered channel adapter, idempotently claims and records a
-// delivery attempt in Postgres — honoring per-user channel opt-in/out and
-// DND windows along the way. Run 2-3 instances (same KAFKA_GROUP_ID) to see
-// Kafka spread partitions across them (the topic needs more than 1
-// partition for that to do anything — see `make kafka-topic`).
+// Command worker is the consumer group: it reads events off Kafka and
+// drives each one through the delivery state machine (internal/delivery) —
+// claim, check preferences, send via the right channel adapter, and record
+// the outcome, retrying transient failures with backoff and dead-lettering
+// permanent ones or exhausted retries.
 //
-// What this step deliberately does NOT do yet (later roadmap steps):
-//   - email/push channel adapters — only "in-app" (Redis Pub/Sub, see
-//     internal/adapters) is registered so far
-//   - retry-with-backoff / dead-letter queue — a failed claim or send is
-//     logged and the offset is still committed, so today a transient
-//     failure means that (event_id, channel) is simply never retried.
-//     That gap is exactly what the DLQ + admin-replay step fixes.
+// Two independent loops run in this process:
+//   - the Kafka fetch loop: turns each new message into a claim (first
+//     sight of an event, attempt 1)
+//   - the reclaim-scan loop: a single extra goroutine (NOT a worker pool —
+//     it does one job, sequentially) that periodically finds retryable
+//     deliveries whose backoff has elapsed, or pending deliveries whose
+//     claim has gone stale (their worker likely crashed), and re-drives
+//     them through the exact same processing logic. This is what actually
+//     fixes the "crash after claim, stuck pending forever" failure mode:
+//     once a claim goes stale, this loop reclaims and retries it -- Kafka
+//     redelivery is no longer what drives retries past the first attempt.
+//
+// Run 2-3 instances (same KAFKA_GROUP_ID) to see Kafka spread partitions
+// across them (the topic needs more than 1 partition for that to do
+// anything — see `make kafka-topic`).
 package main
 
 import (
@@ -28,6 +35,7 @@ import (
 	"realtime-notification-system/internal/adapters"
 	"realtime-notification-system/internal/config"
 	"realtime-notification-system/internal/db"
+	"realtime-notification-system/internal/delivery"
 	"realtime-notification-system/internal/kafkaclient"
 	"realtime-notification-system/internal/models"
 	"realtime-notification-system/internal/preferences"
@@ -35,8 +43,8 @@ import (
 
 // processTimeout bounds how long a single already-fetched message is given
 // to finish (claim + preference check + adapter sends + commit) once a
-// shutdown signal has arrived. It's intentionally NOT the same context used
-// to wait for the *next* message — see the comment on rootCtx below.
+// shutdown signal has arrived. Deliberately NOT the same context used to
+// wait for the *next* message — see the comment on rootCtx below.
 const processTimeout = 15 * time.Second
 
 func main() {
@@ -53,11 +61,14 @@ func main() {
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, Password: cfg.RedisPassword})
 	defer rdb.Close()
 
+	dlqProducer := kafkaclient.NewProducer(cfg.KafkaBrokers, cfg.KafkaDLQTopic)
+	defer dlqProducer.Close()
+
 	// Every event is offered to every adapter in this list; whether it's
-	// actually sent depends on that user's preferences (see deliver below).
-	channelAdapters := []adapters.Adapter{
+	// actually sent depends on that user's preferences.
+	proc := delivery.NewProcessor(store, checker, dlqProducer, cfg.RetryPolicy, []adapters.Adapter{
 		adapters.NewInApp(rdb),
-	}
+	})
 
 	consumer := kafkaclient.NewConsumer(cfg.KafkaBrokers, cfg.KafkaEventsTopic, cfg.KafkaGroupID)
 	defer consumer.Close()
@@ -65,18 +76,44 @@ func main() {
 	pid := os.Getpid()
 
 	// rootCtx is cancelled the instant SIGINT/SIGTERM arrives. It is used
-	// ONLY to unblock the "wait for the next message" call below — it is
-	// deliberately never passed into deliver() for a message already in
-	// hand, because pgx and go-redis both honor context cancellation and
-	// would abort a half-done DB write or Redis publish mid-flight. That
-	// would turn a clean shutdown into the exact "crashed mid-processing"
-	// failure case the audit flagged — self-inflicted, avoidably. A message
-	// already fetched gets its own bounded-but-separate context
-	// (processTimeout) instead, so it's allowed to finish.
+	// ONLY to unblock the "wait for the next message" call and the reclaim
+	// loop's ticker wait — it is deliberately never passed into an
+	// in-flight process() call, because pgx and go-redis both honor
+	// context cancellation and would abort a half-done DB write or Redis
+	// publish mid-flight. That would turn a clean shutdown into the exact
+	// "crashed mid-processing" failure case this phase exists to handle —
+	// self-inflicted, avoidably. Work already in hand gets its own
+	// bounded-but-separate context (processTimeout) instead.
 	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("worker: pid=%d consuming topic=%s group=%s brokers=%v", pid, cfg.KafkaEventsTopic, cfg.KafkaGroupID, cfg.KafkaBrokers)
+	// The reclaim-scan loop: one dedicated goroutine, one job, running
+	// sequentially -- not a worker pool. It's what re-drives retries and
+	// recovers stale claims; see the package doc above.
+	reclaimDone := make(chan struct{})
+	go func() {
+		defer close(reclaimDone)
+		ticker := time.NewTicker(cfg.ReclaimInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-rootCtx.Done():
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), processTimeout)
+				n, err := proc.ReclaimSweep(ctx)
+				cancel()
+				if err != nil {
+					log.Printf("worker: pid=%d reclaim sweep error: %v", pid, err)
+				} else if n > 0 {
+					log.Printf("worker: pid=%d reclaim sweep reclaimed %d row(s)", pid, n)
+				}
+			}
+		}
+	}()
+
+	log.Printf("worker: pid=%d consuming topic=%s group=%s brokers=%v reclaim_interval=%s stale_claim_timeout=%s max_attempts=%d",
+		pid, cfg.KafkaEventsTopic, cfg.KafkaGroupID, cfg.KafkaBrokers, cfg.ReclaimInterval, cfg.RetryPolicy.StaleClaimTimeout, cfg.RetryPolicy.MaxAttempts)
 
 runLoop:
 	for {
@@ -95,19 +132,20 @@ runLoop:
 		var event models.Event
 		if err := json.Unmarshal(msg.Value, &event); err != nil {
 			// A message we can never parse would otherwise block this
-			// partition forever. Commit past it now; routing it to a DLQ
-			// instead of dropping it is the retry/DLQ step's job.
+			// partition forever. Commit past it now; there's no retryable
+			// delivery_status row to route to the DLQ since we never even
+			// got as far as claiming one.
 			log.Printf("worker: skipping unparseable message at partition=%d offset=%d: %v", msg.Partition, msg.Offset, err)
 			_ = consumer.Commit(procCtx, msg)
 		} else {
 			log.Printf("worker: pid=%d fetched partition=%d offset=%d event=%s user=%s", pid, msg.Partition, msg.Offset, event.EventID, event.UserID)
 
-			for _, adapter := range channelAdapters {
-				deliver(procCtx, store, checker, adapter, event)
-			}
-
-			if err := consumer.Commit(procCtx, msg); err != nil {
-				log.Printf("worker: commit failed partition=%d offset=%d: %v", msg.Partition, msg.Offset, err)
+			if proc.HandleNew(procCtx, event) {
+				if err := consumer.Commit(procCtx, msg); err != nil {
+					log.Printf("worker: commit failed partition=%d offset=%d: %v", msg.Partition, msg.Offset, err)
+				}
+			} else {
+				log.Printf("worker: not committing partition=%d offset=%d: claim failed (Postgres unreachable?), will be redelivered", msg.Partition, msg.Offset)
 			}
 		}
 
@@ -119,49 +157,6 @@ runLoop:
 		}
 	}
 
+	<-reclaimDone
 	log.Printf("worker: pid=%d closed cleanly", pid)
-}
-
-// deliver claims (event, adapter) idempotently, checks the user's
-// preferences, and only then sends via the adapter — recording whichever
-// outcome actually happened.
-func deliver(ctx context.Context, store *db.Store, checker *preferences.Checker, adapter adapters.Adapter, event models.Event) {
-	channel := adapter.Name()
-
-	claimed, err := store.ClaimDelivery(ctx, event.EventID, event.UserID, channel)
-	if err != nil {
-		log.Printf("worker: claim failed event=%s channel=%s: %v", event.EventID, channel, err)
-		return
-	}
-	if !claimed {
-		log.Printf("worker: duplicate delivery skipped event=%s channel=%s", event.EventID, channel)
-		return
-	}
-
-	allowed, err := checker.Allowed(ctx, event.UserID, channel)
-	if err != nil {
-		// Fail closed: record it as failed (visible in delivery_status)
-		// rather than guessing whether the user actually wanted this.
-		log.Printf("worker: preference check failed event=%s channel=%s: %v", event.EventID, channel, err)
-		_ = store.MarkStatus(ctx, event.EventID, channel, "failed", err)
-		return
-	}
-	if !allowed {
-		log.Printf("worker: skipped by preferences event=%s channel=%s", event.EventID, channel)
-		_ = store.MarkStatus(ctx, event.EventID, channel, "skipped", nil)
-		return
-	}
-
-	sendErr := adapter.Send(ctx, event)
-	status := "sent"
-	if sendErr != nil {
-		status = "failed"
-		log.Printf("worker: delivery failed event=%s channel=%s: %v", event.EventID, channel, sendErr)
-	} else {
-		log.Printf("worker: delivered event=%s user=%s type=%s via channel=%s", event.EventID, event.UserID, event.Type, channel)
-	}
-
-	if err := store.MarkStatus(ctx, event.EventID, channel, status, sendErr); err != nil {
-		log.Printf("worker: mark status failed event=%s channel=%s: %v", event.EventID, channel, err)
-	}
 }

@@ -1,4 +1,4 @@
-.PHONY: up down logs run-api run-worker build migrate-up migrate-down kafka-topic
+.PHONY: up down logs run-api run-worker build migrate-up migrate-down kafka-topic test
 
 ## Start Postgres, Redis, Redpanda (+ console) in the background.
 up:
@@ -12,6 +12,12 @@ up:
 ## it's a no-op if the topic already exists with the right partition count).
 kafka-topic:
 	docker compose exec -T redpanda rpk topic create notifications.events --partitions 3 --replicas 1 2>&1 | grep -v "TOPIC_ALREADY_EXISTS" || true
+	docker compose exec -T redpanda rpk topic create notifications.events.dlq --partitions 3 --replicas 1 2>&1 | grep -v "TOPIC_ALREADY_EXISTS" || true
+
+## Run the delivery-state/retry/DLQ tests (internal/delivery). Requires
+## Postgres up and migrations applied.
+test:
+	go test ./... -v -count=1
 
 ## Stop and remove the local infra containers (data volumes kept).
 down:

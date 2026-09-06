@@ -13,3 +13,18 @@ type Event struct {
 	Payload   map[string]any `json:"payload,omitempty"`
 	CreatedAt time.Time      `json:"created_at"`
 }
+
+// DeadLetter is published to the DLQ topic when a delivery permanently
+// fails or exhausts its retries (see internal/delivery). It carries the
+// original event plus enough failure context to diagnose what happened
+// without needing to query Postgres.
+type DeadLetter struct {
+	EventID    string         `json:"event_id"`
+	UserID     string         `json:"user_id"`
+	Channel    string         `json:"channel"`
+	Type       string         `json:"type"`
+	Payload    map[string]any `json:"payload,omitempty"`
+	Attempts   int            `json:"attempts"`
+	FinalError string         `json:"final_error"`
+	FailedAt   time.Time      `json:"failed_at"`
+}

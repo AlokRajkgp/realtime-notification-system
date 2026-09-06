@@ -34,13 +34,20 @@ func NewProducer(brokers []string, topic string) *Producer {
 // Publish JSON-encodes the event and writes it to Kafka with the user ID as
 // the partition key.
 func (p *Producer) Publish(ctx context.Context, event models.Event) error {
-	body, err := json.Marshal(event)
+	return p.PublishValue(ctx, event.UserID, event)
+}
+
+// PublishValue JSON-encodes any value and writes it to Kafka keyed by key.
+// Publish (above) is the common case; this is used directly for the DLQ
+// producer, which writes models.DeadLetter values instead of models.Event.
+func (p *Producer) PublishValue(ctx context.Context, key string, value any) error {
+	body, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
 
 	return p.writer.WriteMessages(ctx, kafka.Message{
-		Key:   []byte(event.UserID),
+		Key:   []byte(key),
 		Value: body,
 	})
 }

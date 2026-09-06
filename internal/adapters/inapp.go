@@ -41,10 +41,14 @@ func (a *InApp) Name() string { return "in-app" }
 func (a *InApp) Send(ctx context.Context, event models.Event) error {
 	body, err := json.Marshal(event)
 	if err != nil {
-		return fmt.Errorf("marshal event: %w", err)
+		// A malformed event would fail to marshal identically on every
+		// retry -- there's no point trying again, so this is permanent.
+		return &PermanentError{Err: fmt.Errorf("marshal event: %w", err)}
 	}
 
 	if err := a.rdb.Publish(ctx, inAppChannel(event.UserID), body).Err(); err != nil {
+		// Redis being briefly unreachable is exactly the kind of failure
+		// that might succeed on the next try -- transient (the default).
 		return fmt.Errorf("publish to redis: %w", err)
 	}
 	return nil

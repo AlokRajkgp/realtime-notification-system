@@ -7,11 +7,12 @@ idempotent, retried, rate-limited, observable delivery.
 
 ## Status
 
-Repo scaffold, local infra, the producer API, a Postgres-backed idempotent
-consumer/worker honoring per-user preferences, and one real channel adapter
-(in-app, over WebSocket + Redis Pub/Sub). Email/push adapters, rate
-limiting, retry/DLQ, metrics, and the frontend don't exist yet. See
-"Roadmap" below.
+Repo scaffold, local infra, the producer API, a Postgres-backed consumer/
+worker with a real retry/backoff/DLQ state machine honoring per-user
+preferences, and one real channel adapter (in-app, over WebSocket + Redis
+Pub/Sub). Email/push adapters, rate limiting, metrics, and the frontend
+don't exist yet. See "Roadmap" below and `docs/INTERVIEW_NOTES.md` for the
+full design writeup.
 
 ## Stack
 
@@ -35,12 +36,15 @@ internal/
   adapters/     # one Adapter per delivery channel (in-app so far)
   api/          # Gin router + handlers
   config/       # env var loading
-  db/           # Postgres store: delivery_status, preferences, DND — claim/mark/query
+  db/           # Postgres store: delivery_status state machine, preferences, DND
+  delivery/     # the retry/backoff/DLQ state machine itself (unit-tested)
   kafkaclient/  # Kafka producer/consumer wrappers
   models/       # shared structs
   preferences/  # combines opt-in/out + DND into one Allowed() check (worker-only)
+  retry/        # centralized backoff policy (pure, no I/O)
   ws/           # WebSocket hub for the in-app channel
 migrations/  # golang-migrate .sql files
+docs/INTERVIEW_NOTES.md  # full design + interview-prep writeup
 tools/ws-test.html  # throwaway browser page for eyeballing the in-app channel
 docker-compose.yml  # Postgres + Redis + Redpanda (+ console) for local dev
 ```
@@ -51,7 +55,7 @@ docker-compose.yml  # Postgres + Redis + Redpanda (+ console) for local dev
 cp .env.example .env
 make up             # starts Postgres, Redis, Redpanda, Redpanda Console (localhost:8081)
 make kafka-topic     # creates notifications.events with 3 partitions (see "Scaling" below)
-make migrate-up      # creates delivery_status, user_preferences, user_dnd_windows
+make migrate-up      # creates delivery_status (+ retry state), user_preferences, user_dnd_windows
 make run-api         # producer API on :8080
 make run-worker      # consumer group — run in 2-3 terminals to see partitions spread across them
 ```
@@ -144,6 +148,25 @@ connection server-side. Verified locally: a client that stops reading after
 connecting (holding the TCP socket open but never answering pings) was
 detected and disconnected in exactly 20s.
 
+### Retry, backoff, and the DLQ
+
+`delivery_status` is a real state machine now: `pending → sent | skipped |
+retryable | dead`. A transient send failure (e.g. Redis briefly
+unreachable) schedules a retry with exponential backoff + jitter
+(`MAX_ATTEMPTS`, `INITIAL_BACKOFF`, `MAX_BACKOFF`, `BACKOFF_JITTER`); a
+permanent one, or exhausting `MAX_ATTEMPTS`, publishes to the real Kafka
+DLQ topic (`KAFKA_DLQ_TOPIC`) and marks the row `dead`. A background scan
+in the worker (`RECLAIM_INTERVAL`, `STALE_CLAIM_TIMEOUT`) both re-drives
+due retries and recovers deliveries whose worker crashed mid-processing —
+see `docs/INTERVIEW_NOTES.md` for the full design, race-condition
+reasoning, and failure-matrix. Every scenario below was verified with a
+real (not simulated) Redis outage against the running system, plus 10
+deterministic Go tests in `internal/delivery`:
+
+```
+make test
+```
+
 ## Roadmap
 
 - [x] Repo scaffold, docker-compose (Postgres/Redis/Redpanda), producer API
@@ -152,8 +175,8 @@ detected and disconnected in exactly 20s.
 - [x] Delivery status query API (`GET /api/v1/events/:event_id/status`)
 - [x] In-app channel adapter: WebSocket + Redis Pub/Sub fan-out
 - [x] User preferences: per-channel opt-in/out + DND windows
+- [x] Retry with backoff + Dead Letter Queue + stale-claim recovery
 - [ ] Email + one more channel adapter (push or SMS stub)
-- [ ] Retry with backoff + Dead Letter Queue + admin replay endpoint
 - [ ] Per-user rate limiting (Redis token bucket)
 - [ ] Prometheus /metrics + Grafana dashboard
 - [ ] Minimal React frontend
