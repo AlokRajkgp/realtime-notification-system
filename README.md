@@ -50,7 +50,7 @@ docker-compose.yml  # Postgres + Redis + Redpanda (+ console) for local dev
 ```
 cp .env.example .env
 make up            # starts Postgres, Redis, Redpanda, Redpanda Console (localhost:8081)
-make migrate-up     # creates the delivery_status table
+make migrate-up     # creates delivery_status, user_preferences, user_dnd_windows
 make run-api        # producer API on :8080
 make run-worker      # consumer group — run in a second terminal (start 2-3 for a real "group")
 ```
