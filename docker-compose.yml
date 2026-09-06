@@ -1,0 +1,74 @@
+name: realtime-notification-system
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: notify
+      POSTGRES_PASSWORD: notify
+      POSTGRES_DB: notify
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notify -d notify"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Redpanda: a Kafka-API-compatible broker, single binary (no ZooKeeper/JVM),
+  # so local dev is one lightweight container instead of a Kafka+ZK cluster.
+  # Our Go code only ever talks the Kafka wire protocol, so swapping this for
+  # real Kafka (or a hosted Kafka-compatible service) later needs no code changes.
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=512M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:19092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092,OUTSIDE://localhost:19092
+      - --pandaproxy-addr=0.0.0.0:8082
+      - --advertise-pandaproxy-addr=localhost:8082
+    ports:
+      - "19092:19092" # Kafka API, reachable from the host (and cmd/api via KAFKA_BROKERS=localhost:19092)
+      - "8082:8082"   # HTTP proxy (unused for now, handy for debugging)
+      - "9644:9644"   # admin API
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9644/v1/status/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Web UI for browsing topics/messages/consumer groups — optional but makes
+  # demoing/debugging the Kafka side much easier than the CLI.
+  redpanda-console:
+    image: redpandadata/console:v2.8.2
+    restart: unless-stopped
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8081:8080"
+    depends_on:
+      - redpanda
+
+volumes:
+  pgdata:
